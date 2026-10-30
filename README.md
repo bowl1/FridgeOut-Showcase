@@ -46,31 +46,126 @@ Choose dietary preferences and a maximum cooking time. A free allowance and two 
   <img src="assets/screenshots/07-preferences.png" width="260" alt="Dietary and cooking-time preferences" />
 </p>
 
-**Release status:** iOS distribution and purchase validation are in progress as of October 2026. This repository does not claim an approved App Store release, paying customers or production-scale usage. Screenshots may show a development account; they are product demonstrations, not evaluation evidence. Dish images are AI illustrations, not photos of tested meals.
+**Release status:** iOS distribution and purchase validation are in progress as of October 2026. 
 
-## Engineering case study
+## System boundaries
 
-The interesting problem is making a paid AI feature trustworthy enough to use repeatedly. A fluent recipe is not sufficient: it must respect a real user's inventory, survive unreliable mobile networks, avoid duplicate image spending, and keep account data isolated.
+```mermaid
+flowchart LR
+  User[User] --> Mobile[Expo / React Native app]
+  Mobile -->|Sign-in / refresh| Auth[Supabase Auth]
+  Mobile -->|HTTPS + access token| API[FastAPI]
+  API -->|Verify identity| Auth
+  API --> Graph[LangGraph workflow]
+  Graph --> Tools[MCP tool adapter / stdio server]
+  Tools -->|User JWT + RLS| DB[(Supabase Postgres)]
+  Graph --> Models[OpenAI structured generation / evaluation]
+  API --> Images[Image service + database lease]
+  Images --> ImageModel[OpenAI image generation]
+  Images --> Storage[Supabase private Storage]
+  Mobile -->|Apple purchase through SDK| RC[RevenueCat / Apple]
+  API -->|Server verification| RC
+  API -->|Scoped administrative operations| DB
+```
 
-The project combines a TypeScript / React Native app built with Expo, a Python / FastAPI backend, a bounded LangGraph workflow, MCP data tools, Supabase authentication/database/storage, OpenAI multimodal and image APIs, and Apple / RevenueCat billing. I developed it with AI-assisted tooling; the interview material focuses on design decisions, code behavior and verification rather than claiming every line was written without assistance.
+The image service, billing and accounting are separate from the recipe graph. They are API responsibilities, rather than capabilities the language model can freely invoke. Render hosts the backend. The administrative storage/accounting credential remains server-side; it bypasses RLS, so those paths need explicit ownership and operation checks.
 
-| Engineering problem | Implemented approach | Discuss the trade-off |
+## Component responsibilities
+
+| Layer | Responsibility | What it should not decide |
 | --- | --- | --- |
-| Photo recognition can misidentify quantities | Structured recognition followed by explicit human confirmation | More user effort in exchange for a controlled inventory write |
-| Generated recipes can invent ingredients | Deterministic constraints, a separate model evaluation call and bounded regeneration | A model judge adds coverage but is not an independent proof of correctness |
-| Agent tools could access the wrong account | Verified identity propagation plus database row-level security | Tool separation adds a process boundary and operational overhead |
-| Reopening the app can cause repeated image work | Stored images, database leases, signed URLs and local image caches | Coordination and cleanup become part of the feature |
-| Offline deletion can reappear after refresh | Account-scoped persistent tombstones and a retry queue | Eventual consistency; the app must run to synchronize |
-| AI retries can overspend | Persistent idempotency, atomic budget reservations and server-verified allowances | Conservative reservations can reject work before the actual bill is known |
+| Mobile app | Recognition review, kitchen edits, preferences, recipes, caches, purchase UI | Subscription authority or another account's data access |
+| FastAPI | Authentication, input validation, jobs, quotas, images and billing coordination | Invented inventory when a tool fails |
+| LangGraph | Load context, generate candidates, validate/evaluate, retry within bounds, rank | Arbitrary actions or unlimited retries |
+| MCP tools | Typed inventory/preference/recipe operations using verified request identity | Accept a model-selected user ID as authorization |
+| Postgres / RLS | Ownership isolation, durable state, atomic accounting and leases | Treat client state as proof of entitlement |
+| Storage | Persist generated images and serve authorized signed URLs | Make all images publicly readable |
 
-### Read the technical story
+## Photo to recipe
 
-- [Architecture](docs/ARCHITECTURE.md): system boundaries, identity, storage and request flows.
-- [AI workflow](docs/AI_WORKFLOW.md): LangGraph, MCP, guardrails, the model judge and offline evals.
-- [Engineering challenges](docs/ENGINEERING_CHALLENGES.md): failure scenarios, decisions and limits.
-- [Validation and evidence](docs/VALIDATION.md): what the checks establish and what they do not.
-- [面试讲解提纲](docs/INTERVIEW_GUIDE.zh-CN.md): 90 秒介绍、5 分钟讲解和常见追问。
-- [Public repository scope](docs/PUBLIC_SCOPE.md): what is shared and what remains in the product repository.
+```mermaid
+sequenceDiagram
+  actor U as User
+  participant App as Mobile app
+  participant API as FastAPI
+  participant AI as Model API
+  participant DB as Supabase
+  U->>App: Take or select photo
+  App->>API: Recognition request + authenticated token
+  API->>AI: Resized photo + structured output schema
+  AI-->>API: Estimated foods / quantities / confidence
+  API-->>App: Proposed ingredients
+  U->>App: Edit and confirm
+  App->>API: Save confirmed ingredients
+  API->>DB: Authorized inventory writes
+  U->>App: Generate recipes
+  App->>API: Generation request + idempotency key
+  API->>DB: Reserve allowance / budget
+  API->>API: Run bounded recipe workflow
+  API-->>App: Progress and final accepted recipes
+```
+
+Recognition does not write inventory. Confirmation is the boundary between uncertain visual inference and application state. The current confirmation flow saves items individually; a partial network failure can leave some saved and some unsaved.
+
+Accepted recipe progress is persisted in the generation job and polled by the app. Final completion still governs allowance accounting and when favorite/image operations become available. Progress is scoped to the authenticated owner; polling does not start another model call.
+
+## Identity and data ownership
+
+1. Supabase issues the user's session. Native session storage uses SecureStore; web sessions are kept in memory.
+2. FastAPI verifies the access token rather than trusting a client-provided email or user ID.
+3. The trusted request token is passed to the MCP process. MCP revalidates it; tool schemas do not take an arbitrary owner ID.
+4. User data access combines ownership filtering with Postgres RLS. Recipe/session ownership also uses database constraints.
+5. Backend-only accounting, cleanup and upload operations use a service credential with additional application/database authorization checks.
+
+The recipe workflow uses inventory and preference reads. It does not call the inventory mutation tool. Naming a tool in an MCP server is not the same as granting the model autonomous access to it.
+
+## Data lifecycle
+
+| Data | Lifecycle |
+| --- | --- |
+| Confirmed inventory / preferences | Account-linked state, changed by user actions |
+| Generated drafts | Current generation batch; inactive drafts are eligible for scheduled cleanup |
+| Favorites | Explicitly saved by the user and retained until removal |
+| Generated images | Private storage; reusable references and deletion cleanup queue |
+| Mobile cache | Per-account local data and bounded generated-image cache |
+| Pending deletions | Durable local tombstones until synchronized; completed tombstones also filter stale reads |
+| AI usage / reservations | Backend-managed accounting; separate from recipe content |
+
+Temporary drafts and favorites are separate records. A shared recipe read layer allows image and allowance logic to work with either. Deleting data can enqueue storage cleanup; a successful UI response is not proof that every physical object has already been erased.
+
+## Operational trade-offs
+
+- MCP provides a clear tool and identity boundary, but per-request subprocess work adds latency and deployment complexity. Direct typed repository calls would be a reasonable simpler alternative for a small service.
+- Local caches improve repeat visits; signed URL expiration and account changes require invalidation. A missing cached file triggers a download, not necessarily another image generation.
+- Progress polling is simpler to reconnect than a streaming connection, at the cost of repeated read requests.
+- The graph runs in the API service; this is not a standalone durable worker system. Persistent jobs/leases help recovery but do not guarantee arbitrary work continues after process termination.
+
+
+## Execution flow
+
+```mermaid
+flowchart TD
+  Load[Load verified inventory + preferences through MCP] --> Generate[Generate structured candidates]
+  Generate --> Rules[Deterministic guardrails]
+  Rules --> Judge[Batch model evaluation of passing candidates]
+  Judge --> Select[Threshold + name deduplication + accepted results]
+  Select --> More{Fewer than 5 accepted,
+  inventory exists,
+  fewer than 3 rounds?}
+  More -->|Yes: rejection feedback| Generate
+  More -->|No| Rank[Rank and return up to 5]
+```
+
+Empty or incompatible inventory can produce zero results. A tool failure propagates as an error; the system does not replace missing context with plausible ingredients. Accepted candidates from earlier rounds are retained and subsequent generation receives rejection feedback and accepted names.
+
+## Four mechanisms with different jobs
+
+| Mechanism | Runs when | What it establishes | What it cannot establish |
+| --- | --- | --- | --- |
+| Structured output schema | Recognition, generation and judge calls | Expected fields, types, ranges and shape | Truth, feasibility or ownership |
+| Deterministic guardrails | Every generated candidate | Inventory quantities/units, approved pantry staples, dictionary restrictions, time and a cooking-action check | Every semantic ingredient mention or medically safe diets |
+| Separate LLM judge call | Candidates passing hard rules | A model's assessment of feasibility, instructions and semantic violations | Guaranteed hallucination detection or ground-truth quality |
+| Offline eval runner | Development / regression evaluation | Dataset-level behavior and reproducible comparisons | App-scale quality from a small fixture set |
 
 ### Run the public examples
 
@@ -84,10 +179,4 @@ python3 -m unittest discover -s tests -v
 
 These are deliberately simplified, runnable teaching examples inspired by the product. They demonstrate [cumulative inventory constraints](examples/recipe_constraints.py) and [account-scoped offline deletion](examples/offline_deletions.py). They do **not** implement the complete app, call a live model or reproduce the production security boundary. Example output is fixture evidence, not a live-model quality benchmark.
 
-## About this repository
 
-FridgeOut's complete application, prompts, billing implementation, deployment configuration and database migrations are maintained separately. This repository starts with a fresh Git history and contains only documentation, product assets and selected educational code. It is not an installable copy of the paid app.
-
-Questions: [bowenivy0@gmail.com](mailto:bowenivy0@gmail.com). [Privacy policy](https://fridgechef-api-0lcg.onrender.com/privacy).
-
-Copyright © 2026 Bowen Li. All rights reserved. See [NOTICE](NOTICE).
