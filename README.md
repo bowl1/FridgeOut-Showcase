@@ -2,12 +2,11 @@
 
 <h1 align="center">FridgeOut · Recipe Wizard</h1>
 <p align="center"><strong>Cook with what you have.</strong></p>
-<p align="center">A mobile product that turns the ingredients you already have into cooked meal ideas.<br />Product showcase, engineering case study and selected educational examples.</p>
-
+<p align="center">A mobile product that turns the ingredients you already have into cooked meal ideas.<br />
+<p align="center">Try the TestFlight link: <a href="https://testflight.apple.com/join/QqwUY2qK">https://testflight.apple.com/join/QqwUY2qK</a></p>
 <p align="center">
   <a href="#from-fridge-to-dinner">Product</a> ·
   <a href="#engineering-case-study">Engineering</a> ·
-  <a href="docs/INTERVIEW_GUIDE.zh-CN.md">面试讲解</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="docs/AI_WORKFLOW.md">AI workflow</a> ·
   <a href="#run-the-public-examples">Run examples</a>
